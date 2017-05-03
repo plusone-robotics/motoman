@@ -47,12 +47,17 @@
 #include "simple_message/messages/joint_traj_pt_message.h"
 #include "trajectory_msgs/JointTrajectory.h"
 #include "motoman_driver/industrial_robot_client/robot_group.h"
+#include "motoman_driver/io_ctrl.h"
+#include "motoman_msgs/ReadSingleIO.h"
+#include "motoman_msgs/WriteSingleIO.h"
+#include <boost/thread/thread.hpp>
 
 namespace industrial_robot_client
 {
 namespace joint_trajectory_interface
 {
 
+using motoman::io_ctrl::MotomanIoCtrl;
 using industrial::smpl_msg_connection::SmplMsgConnection;
 using industrial::tcp_client::TcpClient;
 using industrial::joint_traj_pt_message::JointTrajPtMessage;
@@ -347,10 +352,21 @@ protected:
   ros::ServiceServer srv_joint_trajectory_ex_;  // handle for joint-trajectory service
   ros::ServiceServer srv_stop_motion_;   // handle for stop_motion service
 
+  MotomanIoCtrl io_ctrl_;
+  ros::ServiceServer srv_read_single_io;   // handle for read_single_io service
+  ros::ServiceServer srv_write_single_io;   // handle for write_single_io service
+
+  bool readSingleIoCB(motoman_msgs::ReadSingleIO::Request &req,
+                            motoman_msgs::ReadSingleIO::Response &res);
+  bool writeSingleIoCB(motoman_msgs::WriteSingleIO::Request &req,
+                            motoman_msgs::WriteSingleIO::Response &res);
+
   std::map<int, ros::ServiceServer> srv_stops_;
   std::map<int, ros::ServiceServer> srv_joints_;
   std::map<int, ros::Subscriber> sub_joint_trajectories_;
   std::map<int, ros::Subscriber> sub_cur_positions_;
+
+  boost::mutex mutex_;
 
   std::vector<std::string> all_joint_names_;
   std::map<int, RobotGroup> robot_groups_;

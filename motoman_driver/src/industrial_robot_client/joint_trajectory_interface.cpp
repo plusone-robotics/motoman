@@ -126,6 +126,14 @@ bool JointTrajectoryInterface::init(SmplMsgConnection* connection, const std::ve
   this->sub_cur_pos_ = this->node_.subscribe(
                          "joint_states", 1, &JointTrajectoryInterface::jointStateCB, this);
 
+  // hacking this in here at this place
+  ROS_INFO_STREAM("MotomanJointTrajectoryStreamer creating io service");
+  io_ctrl_.init(connection);
+  this->srv_read_single_io = this->node_.advertiseService("read_single_io",
+      &JointTrajectoryInterface::readSingleIoCB, this);
+  this->srv_write_single_io = this->node_.advertiseService("write_single_io",
+      &JointTrajectoryInterface::writeSingleIoCB, this);
+
   return true;
 }
 
@@ -729,6 +737,52 @@ void JointTrajectoryInterface::jointStateCB(
   const sensor_msgs::JointStateConstPtr &msg, int robot_id)
 {
   this->cur_joint_pos_map_[robot_id] = *msg;
+}
+
+// Service to read a single IO
+bool JointTrajectoryInterface::readSingleIoCB(
+  motoman_msgs::ReadSingleIO::Request &req,
+  motoman_msgs::ReadSingleIO::Response &res)
+{
+  industrial::shared_types::shared_int io_val= -1;
+
+  // send message and release mutex as soon as possible
+  this->mutex_.lock();
+  bool result = io_ctrl_.readSingleIO(req.address, io_val);
+  this->mutex_.unlock();
+
+  if (!result)
+  {
+    ROS_ERROR("Reading IO element %d failed", req.address);
+    return false;
+  }
+  res.value = io_val;
+  ROS_INFO("Element %d value: %d", req.address, io_val);
+
+  return true;
+}
+
+
+// Service to write Single IO
+bool JointTrajectoryInterface::writeSingleIoCB(
+  motoman_msgs::WriteSingleIO::Request &req,
+  motoman_msgs::WriteSingleIO::Response &res)
+{
+  industrial::shared_types::shared_int io_val= -1;
+
+  // send message and release mutex as soon as possible
+  this->mutex_.lock();
+  bool result = io_ctrl_.writeSingleIO(req.address, req.value);
+  this->mutex_.unlock();
+
+  if (!result)
+  {
+    ROS_ERROR("Writing IO element %d failed", req.address);
+    return false;
+  }
+  ROS_INFO("Element %d set to: %d", req.address, req.value);
+
+  return true;
 }
 
 }  // namespace joint_trajectory_interface
