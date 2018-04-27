@@ -32,7 +32,6 @@
 #ifndef MOTOMAN_DRIVER_INDUSTRIAL_ROBOT_CLIENT_JOINT_TRAJECTORY_STREAMER_H
 #define MOTOMAN_DRIVER_INDUSTRIAL_ROBOT_CLIENT_JOINT_TRAJECTORY_STREAMER_H
 
-#include <boost/thread/thread.hpp>
 #include "motoman_driver/industrial_robot_client/joint_trajectory_interface.h"
 #include <map>
 #include <vector>
@@ -128,7 +127,6 @@ protected:
   void trajectoryStop();
 
   boost::thread* streaming_thread_;
-  boost::mutex mutex_;
   int current_point_;
   std::vector<SimpleMessage> current_traj_;
   TransferState state_;

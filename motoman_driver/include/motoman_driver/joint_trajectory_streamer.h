@@ -41,8 +41,6 @@
 #include "simple_message/simple_message.h"
 #include "std_srvs/Trigger.h"
 #include "motoman_driver/io_ctrl.h"
-#include "motoman_msgs/ReadSingleIO.h"
-#include "motoman_msgs/WriteSingleIO.h"
 
 namespace motoman
 {
@@ -140,14 +138,6 @@ protected:
   MotomanIoCtrl io_ctrl_;
 
   std::map<int, MotomanMotionCtrl> motion_ctrl_map_;
-
-  ros::ServiceServer srv_read_single_io;   // handle for read_single_io service
-  ros::ServiceServer srv_write_single_io;   // handle for write_single_io service
-
-  bool readSingleIoCB(motoman_msgs::ReadSingleIO::Request &req,
-                            motoman_msgs::ReadSingleIO::Response &res);
-  bool writeSingleIoCB(motoman_msgs::WriteSingleIO::Request &req,
-                            motoman_msgs::WriteSingleIO::Response &res);
 
   void trajectoryStop();
   bool is_valid(const trajectory_msgs::JointTrajectory &traj);

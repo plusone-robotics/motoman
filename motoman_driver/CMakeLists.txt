@@ -77,10 +77,12 @@ set(CLIENT_SRC_FILES
   src/industrial_robot_client/joint_trajectory_interface.cpp
   src/industrial_robot_client/joint_trajectory_streamer.cpp
   src/industrial_robot_client/motoman_utils.cpp
+  src/industrial_robot_client/io_ctrl.cpp
   src/simple_message/joint_feedback_ex.cpp
   src/simple_message/joint_traj_pt_full_ex.cpp
   src/simple_message/messages/joint_feedback_ex_message.cpp
-  src/simple_message/messages/joint_traj_pt_full_ex_message.cpp)
+  src/simple_message/messages/joint_traj_pt_full_ex_message.cpp
+)
 
 ###########
 ## Build ##
@@ -98,6 +100,7 @@ target_link_libraries(motoman_simple_message
 # Industrial client library
 add_library(motoman_industrial_robot_client ${CLIENT_SRC_FILES})
 target_link_libraries(motoman_industrial_robot_client
+  motoman_simple_message
   industrial_robot_client
   industrial_utils)
 add_dependencies(motoman_industrial_robot_client ${catkin_EXPORTED_TARGETS})
@@ -117,8 +120,7 @@ set_target_properties(motoman_robot_state
 add_executable(motoman_motion_streaming_interface
   src/joint_streaming_node.cpp
   src/joint_trajectory_streamer.cpp
-  src/motion_ctrl.cpp
-  src/io_ctrl.cpp)
+  src/motion_ctrl.cpp)
 target_link_libraries(motoman_motion_streaming_interface
   motoman_simple_message
   motoman_industrial_robot_client
@@ -140,6 +142,7 @@ target_link_libraries(motoman_simple_message_bswap
 add_library(motoman_industrial_robot_client_bswap ${CLIENT_SRC_FILES})
 set_target_properties(motoman_industrial_robot_client PROPERTIES COMPILE_DEFINITIONS "BYTE_SWAPPING")
 target_link_libraries(motoman_industrial_robot_client_bswap
+  motoman_simple_message
   industrial_robot_client_bswap
   industrial_utils)
 add_dependencies(motoman_industrial_robot_client_bswap ${catkin_EXPORTED_TARGETS})
@@ -159,8 +162,7 @@ set_target_properties(motoman_robot_state_bswap
 add_executable(motoman_motion_streaming_interface_bswap
   src/joint_streaming_node.cpp
   src/joint_trajectory_streamer.cpp
-  src/motion_ctrl.cpp
-  src/io_ctrl.cpp)
+  src/motion_ctrl.cpp)
 target_link_libraries(motoman_motion_streaming_interface_bswap
   motoman_simple_message_bswap
   motoman_industrial_robot_client_bswap
