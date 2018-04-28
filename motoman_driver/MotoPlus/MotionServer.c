@@ -50,11 +50,14 @@
 // Main Task: 
 void Ros_MotionServer_StartNewConnection(Controller* controller, int sd);
 void Ros_MotionServer_StopConnection(Controller* controller, int connectionIndex);
+
 // WaitForSimpleMsg Task:
 void Ros_MotionServer_WaitForSimpleMsg(Controller* controller, int connectionIndex);
 BOOL Ros_MotionServer_SimpleMsgProcess(Controller* controller, SimpleMsg* receiveMsg, int byteSize, SimpleMsg* replyMsg);
 int Ros_MotionServer_MotionCtrlProcess(Controller* controller, SimpleMsg* receiveMsg, SimpleMsg* replyMsg);
 BOOL Ros_MotionServer_StopMotion(Controller* controller);
+BOOL Ros_MotionServer_ServoPower(Controller* controller, int servoOnOff);
+BOOL Ros_MotionServer_ResetAlarm(Controller* controller);
 BOOL Ros_MotionServer_StartTrajMode(Controller* controller);
 BOOL Ros_MotionServer_StopTrajMode(Controller* controller);
 int Ros_MotionServer_JointTrajDataProcess(Controller* controller, SimpleMsg* receiveMsg, SimpleMsg* replyMsg);
@@ -63,6 +66,7 @@ int Ros_MotionServer_InitTrajPointFullEx(CtrlGroup* ctrlGroup, SmBodyJointTrajPt
 int Ros_MotionServer_AddTrajPointFull(CtrlGroup* ctrlGroup, SmBodyJointTrajPtFull* jointTrajData);
 int Ros_MotionServer_AddTrajPointFullEx(CtrlGroup* ctrlGroup, SmBodyJointTrajPtExData* jointTrajDataEx, int sequence);
 int Ros_MotionServer_JointTrajPtFullExProcess(Controller* controller, SimpleMsg* receiveMsg, SimpleMsg* replyMsg);
+
 // AddToIncQueue Task:
 void Ros_MotionServer_AddToIncQueueProcess(Controller* controller, int groupNo);
 void Ros_MotionServer_JointTrajDataToIncQueue(Controller* controller, int groupNo);
@@ -71,11 +75,17 @@ BOOL Ros_MotionServer_ClearQ_All(Controller* controller);
 BOOL Ros_MotionServer_HasDataInQueue(Controller* controller);
 int Ros_MotionServer_GetQueueCnt(Controller* controller, int groupNo);
 void Ros_MotionServer_IncMoveLoopStart(Controller* controller);
+
 // Utility functions:
 void Ros_MotionServer_ConvertToJointMotionData(SmBodyJointTrajPtFull* jointTrajData, JointMotionData* jointMotionData);
+STATUS Ros_MotionServer_DisableEcoMode(Controller* controller);
+void Ros_MotionServer_PrintError(USHORT err_no, char* msgPrefix);
+
 // IO functions:
-int Ros_MotionServer_ReadIO(Controller* controller, SimpleMsg* receiveMsg, SimpleMsg* replyMsg);
-int Ros_MotionServer_WriteIO(Controller* controller, SimpleMsg* receiveMsg, SimpleMsg* replyMsg);
+int Ros_MotionServer_ReadIOBit(SimpleMsg* receiveMsg, SimpleMsg* replyMsg);
+int Ros_MotionServer_WriteIOBit(SimpleMsg* receiveMsg, SimpleMsg* replyMsg);
+int Ros_MotionServer_ReadIOGroup(SimpleMsg* receiveMsg, SimpleMsg* replyMsg);
+int Ros_MotionServer_WriteIOGroup(SimpleMsg* receiveMsg, SimpleMsg* replyMsg);
 
 
 //-----------------------
@@ -91,13 +101,33 @@ void Ros_MotionServer_StartNewConnection(Controller* controller, int sd)
 {
 	int groupNo;
 	int connectionIndex;
+
+	//look for next available connection slot
+	for (connectionIndex = 0; connectionIndex < MAX_MOTION_CONNECTIONS; connectionIndex++)
+	{
+		if (controller->sdMotionConnections[connectionIndex] == INVALID_SOCKET)
+		{
+			controller->sdMotionConnections[connectionIndex] = sd;
+			break;
+		}
+	}
 	
-    // If not started, start the IncMoveTask (there should be only one instance of this thread)
-    if(controller->tidIncMoveThread == INVALID_TASK)
-    {
+	if (connectionIndex == MAX_MOTION_CONNECTIONS)
+	{
+		puts("Motion server already connected... not accepting last attempt.");
+		mpClose(sd);
+		return;
+	}
+	
+	// If not started, start the IncMoveTask (there should be only one instance of this thread)
+	if(controller->tidIncMoveThread == INVALID_TASK)
+	{
+#ifdef DEBUG
+		puts("Creating new task: IncMoveTask");
+#endif
 		controller->tidIncMoveThread = mpCreateTask(MP_PRI_IP_CLK_TAKE, MP_STACK_SIZE, 
 													(FUNCPTR)Ros_MotionServer_IncMoveLoopStart,
-				 									(int)controller, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+													(int)controller, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 		if (controller->tidIncMoveThread == ERROR)
 		{
 			puts("Failed to create task for incremental-motion.  Check robot parameters.");
@@ -111,57 +141,51 @@ void Ros_MotionServer_StartNewConnection(Controller* controller, int sd)
 	// If not started, start the AddToIncQueueProcess for each control group
 	for(groupNo = 0; groupNo < controller->numGroup; groupNo++)
 	{
-		controller->ctrlGroups[groupNo]->tidAddToIncQueue = mpCreateTask(MP_PRI_TIME_NORMAL, MP_STACK_SIZE, 
-																		(FUNCPTR)Ros_MotionServer_AddToIncQueueProcess,
-						 												(int)controller, groupNo, 0, 0, 0, 0, 0, 0, 0, 0); 
-		if (controller->ctrlGroups[groupNo]->tidAddToIncQueue == ERROR)
+		if (controller->ctrlGroups[groupNo]->tidAddToIncQueue == INVALID_TASK)
 		{
-			puts("Failed to create task for parsing motion increments.  Check robot parameters.");
+#ifdef DEBUG
+			printf("Creating new task: tidAddToIncQueue (groupNo = %d)\n", groupNo);
+#endif
+			controller->ctrlGroups[groupNo]->tidAddToIncQueue = mpCreateTask(MP_PRI_TIME_NORMAL, MP_STACK_SIZE, 
+																			(FUNCPTR)Ros_MotionServer_AddToIncQueueProcess,
+																			(int)controller, groupNo, 0, 0, 0, 0, 0, 0, 0, 0); 
+			if (controller->ctrlGroups[groupNo]->tidAddToIncQueue == ERROR)
+			{
+				puts("Failed to create task for parsing motion increments.  Check robot parameters.");
+				mpClose(sd);
+				controller->ctrlGroups[groupNo]->tidAddToIncQueue = INVALID_TASK;
+				Ros_Controller_SetIOState(IO_FEEDBACK_FAILURE, TRUE);
+				return;
+			}
+		}
+	}
+	
+
+	if (controller->tidMotionConnections[connectionIndex] == INVALID_TASK)
+	{
+#ifdef DEBUG
+		printf("Creating new task: tidMotionConnections (connectionIndex = %d)\n", connectionIndex);
+#endif
+			
+		//start new task for this specific connection
+		controller->tidMotionConnections[connectionIndex] = mpCreateTask(MP_PRI_TIME_NORMAL, MP_STACK_SIZE, 
+																		(FUNCPTR)Ros_MotionServer_WaitForSimpleMsg,
+																		(int)controller, connectionIndex, 0, 0, 0, 0, 0, 0, 0, 0);
+	
+		if (controller->tidMotionConnections[connectionIndex] != ERROR)
+		{
+			Ros_Controller_SetIOState(IO_FEEDBACK_MOTIONSERVERCONNECTED, TRUE); //set feedback signal indicating success
+		}
+		else
+		{
+			puts("Could not create new task in the motion server.  Check robot parameters.");
 			mpClose(sd);
-			controller->ctrlGroups[groupNo]->tidAddToIncQueue = INVALID_TASK;
+			controller->sdMotionConnections[connectionIndex] = INVALID_SOCKET;
+			controller->tidMotionConnections[connectionIndex] = INVALID_TASK;
 			Ros_Controller_SetIOState(IO_FEEDBACK_FAILURE, TRUE);
 			return;
 		}
 	}
-	
-    //look for next available connection slot
-    for (connectionIndex = 0; connectionIndex < MAX_MOTION_CONNECTIONS; connectionIndex++)
-    {
-       	if (controller->sdMotionConnections[connectionIndex] == INVALID_SOCKET)
-	    {
-	       	//Start the new connection in a different task.
-	       	//Each task's memory will be unique IFF the data is on the stack.
-	       	//Any global or heap stuff will not be unique.
-		    controller->sdMotionConnections[connectionIndex] = sd;
-		    
-    		//start new task for this specific connection
-			controller->tidMotionConnections[connectionIndex] = mpCreateTask(MP_PRI_TIME_NORMAL, MP_STACK_SIZE, 
-																			(FUNCPTR)Ros_MotionServer_WaitForSimpleMsg,
-					 														(int)controller, connectionIndex, 0, 0, 0, 0, 0, 0, 0, 0);
-	
-			if (controller->tidMotionConnections[connectionIndex] != ERROR)
-			{
-				Ros_Controller_SetIOState(IO_FEEDBACK_MOTIONSERVERCONNECTED, TRUE); //set feedback signal indicating success
-			}
-			else
-			{
-				puts("Could not create new task in the motion server.  Check robot parameters.");
-				mpClose(sd);
-				controller->sdMotionConnections[connectionIndex] = INVALID_SOCKET;
-				controller->tidMotionConnections[connectionIndex] = INVALID_TASK;
-				Ros_Controller_SetIOState(IO_FEEDBACK_FAILURE, TRUE);
-				return;
-			}
-			
-			break;
-		}
-    }
-        
-    if (connectionIndex == MAX_MOTION_CONNECTIONS)
-    {
-       	puts("Motion server already connected... not accepting last attempt.");
-       	mpClose(sd);
-    }
 }
 
 
@@ -181,8 +205,8 @@ void Ros_MotionServer_StopConnection(Controller* controller, int connectionIndex
 	//mark connection as invalid
 	controller->sdMotionConnections[connectionIndex] = INVALID_SOCKET;
 
- 	// Check if there are still some valid connection
- 	bDeleteIncMovTask = TRUE;
+	// Check if there are still some valid connection
+	bDeleteIncMovTask = TRUE;
 	for(i=0; i<MAX_MOTION_CONNECTIONS; i++)
 	{
 		if(controller->sdMotionConnections[connectionIndex] != INVALID_SOCKET)
@@ -208,7 +232,7 @@ void Ros_MotionServer_StopConnection(Controller* controller, int connectionIndex
 		}
 		
 		// terminate the inc_move task
- 		tid = controller->tidIncMoveThread;
+		tid = controller->tidIncMoveThread;
 		controller->tidIncMoveThread = INVALID_TASK;
 		mpDeleteTask(tid);
 	}
@@ -218,7 +242,7 @@ void Ros_MotionServer_StopConnection(Controller* controller, int connectionIndex
 	controller->tidMotionConnections[connectionIndex] = INVALID_TASK;
 	printf("Motion Server Connection Closed\r\n");
 	
- 	mpDeleteTask(tid);
+	mpDeleteTask(tid);
 }
 
 
@@ -230,46 +254,50 @@ void Ros_MotionServer_WaitForSimpleMsg(Controller* controller, int connectionInd
 {
 	SimpleMsg receiveMsg;
 	SimpleMsg replyMsg;
-	int byteSize = 0;
+	int byteSize = 0, byteSizeResponse = 0;
 	int minSize = sizeof(SmPrefix) + sizeof(SmHeader);
 	int expectedSize;
 	int ret = 0;
 	BOOL bDisconnect = FALSE;
+	BOOL bHasPreviousData = FALSE; // if true, then receiveMsg is already filled with valid data
 	BOOL bInvalidMsgType = FALSE;
-	
+
 	while(!bDisconnect) //keep accepting messages until connection closes
 	{
-        mpTaskDelay(0);	//give it some time to breathe, if needed
-        
-		//Receive message from the PC
-		memset(&receiveMsg, 0x00, sizeof(receiveMsg));
-        byteSize = mpRecv(controller->sdMotionConnections[connectionIndex], (char*)(&receiveMsg), sizeof(receiveMsg), 0);
-        if (byteSize <= 0)
-        	break; //end connection
-        
+		Ros_Sleep(0);	//give it some time to breathe, if needed
+		
+		if (!bHasPreviousData)
+		{
+			//Receive message from the PC
+			memset(&receiveMsg, 0x00, sizeof(receiveMsg));
+			byteSize = mpRecv(controller->sdMotionConnections[connectionIndex], (char*)(&receiveMsg), sizeof(receiveMsg), 0);
+			if (byteSize <= 0)
+				break; //end connection
+		}
+		
 		bInvalidMsgType = FALSE;
 
-        // Determine the expected size of the message
-       	expectedSize = -1;
-        if(byteSize >= minSize)
-        {
-        	switch(receiveMsg.header.msgType)
-        	{
-        		case ROS_MSG_ROBOT_STATUS: 
-        			expectedSize = minSize + sizeof(SmBodyRobotStatus);
-	    			break;
-        		case ROS_MSG_JOINT_TRAJ_PT_FULL: 
-        			expectedSize = minSize + sizeof(SmBodyJointTrajPtFull);
-	    			break;
-	    		case ROS_MSG_JOINT_FEEDBACK:
-        			expectedSize = minSize + sizeof(SmBodyJointFeedback);
-	    			break;
-	    		case ROS_MSG_MOTO_MOTION_CTRL:
-        			expectedSize = minSize + sizeof(SmBodyMotoMotionCtrl);
-	    			break;
-	    		case ROS_MSG_MOTO_MOTION_REPLY:
-        			expectedSize = minSize + sizeof(SmBodyMotoMotionReply);
-	    			break;
+		// Determine the expected size of the message
+		expectedSize = -1;
+		if(byteSize >= minSize)
+		{
+			switch(receiveMsg.header.msgType)
+			{
+				case ROS_MSG_ROBOT_STATUS: 
+					expectedSize = minSize + sizeof(SmBodyRobotStatus);
+					break;
+				case ROS_MSG_JOINT_TRAJ_PT_FULL: 
+					expectedSize = minSize + sizeof(SmBodyJointTrajPtFull);
+					break;
+				case ROS_MSG_JOINT_FEEDBACK:
+					expectedSize = minSize + sizeof(SmBodyJointFeedback);
+					break;
+				case ROS_MSG_MOTO_MOTION_CTRL:
+					expectedSize = minSize + sizeof(SmBodyMotoMotionCtrl);
+					break;
+				case ROS_MSG_MOTO_MOTION_REPLY:
+					expectedSize = minSize + sizeof(SmBodyMotoMotionReply);
+					break;
 				case ROS_MSG_MOTO_JOINT_TRAJ_PT_FULL_EX:
 					//Don't require the user to send data for non-existant control groups
 					if (byteSize >= (minSize + sizeof(int))) //make sure I can at least get to [numberOfGroups] field
@@ -283,53 +311,62 @@ void Ros_MotionServer_WaitForSimpleMsg(Controller* controller, int connectionInd
 				case ROS_MSG_MOTO_JOINT_FEEDBACK_EX:
 					expectedSize = minSize + sizeof(SmBodyJointFeedbackEx);
 					break;
-					
-				case ROS_MSG_MOTO_READ_SINGLE_IO:
-					expectedSize = minSize + sizeof(SmBodyMotoReadSingleIO);
+				case ROS_MSG_MOTO_READ_IO_BIT:
+					expectedSize = minSize + sizeof(SmBodyMotoReadIOBit);
 					break;
-				case ROS_MSG_MOTO_READ_SINGLE_IO_REPLY:
-					expectedSize = minSize + sizeof(SmBodyMotoReadSingleIOReply);
+				case ROS_MSG_MOTO_WRITE_IO_BIT:
+					expectedSize = minSize + sizeof(SmBodyMotoWriteIOBit);
 					break;
-				case ROS_MSG_MOTO_WRITE_SINGLE_IO:
-					expectedSize = minSize + sizeof(SmBodyMotoWriteSingleIO);
+				case ROS_MSG_MOTO_READ_IO_GROUP:
+					expectedSize = minSize + sizeof(SmBodyMotoReadIOGroup);
 					break;
-				case ROS_MSG_MOTO_WRITE_SINGLE_IO_REPLY:
-					expectedSize = minSize + sizeof(SmBodyMotoWriteSingleIOReply);
+				case ROS_MSG_MOTO_WRITE_IO_GROUP:
+					expectedSize = minSize + sizeof(SmBodyMotoWriteIOGroup);
 					break;
 				default:
 					bInvalidMsgType = TRUE;
 					break;
-        	}
-        }
-        
-        // Check message size
-       	if(byteSize >= expectedSize)
-       	{
-       		// Process the simple message
-          	ret = Ros_MotionServer_SimpleMsgProcess(controller, &receiveMsg, byteSize, &replyMsg);
-			if(ret == 1)
+			}
+		}
+
+		bHasPreviousData = FALSE;
+		// Check message size
+		if(byteSize >= expectedSize && expectedSize <= sizeof(SimpleMsg))
+		{
+			// Process the simple message
+			ret = Ros_MotionServer_SimpleMsgProcess(controller, &receiveMsg, expectedSize, &replyMsg);
+			if(ret == 1) 
+			{
 				bDisconnect = TRUE;
-       	}
+			}
+			else if( byteSize > expectedSize ) 
+			{
+				printf("MessageReceived(%d bytes): expectedSize=%d, processing rest of bytes (%d, %d, %d)\r\n", byteSize,  expectedSize, sizeof(receiveMsg), receiveMsg.body.jointTrajData.sequence, ((int*)((char*)&receiveMsg +  expectedSize))[5]);
+				memmove(&receiveMsg, (char*)&receiveMsg + expectedSize, byteSize-expectedSize);
+				byteSize -= expectedSize;
+				bHasPreviousData = TRUE;
+			}
+		}
 		else if (bInvalidMsgType)
 		{
 			printf("Unknown Message Received(%d)\r\n", receiveMsg.header.msgType);
 			Ros_SimpleMsg_MotionReply(&receiveMsg, ROS_RESULT_INVALID, ROS_RESULT_INVALID_MSGTYPE, &replyMsg, 0);			
 		}
-       	else
-       	{
-       		printf("MessageReceived(%d bytes): expectedSize=%d\r\n", byteSize,  expectedSize);
+		else
+		{
+			printf("MessageReceived(%d bytes): expectedSize=%d\r\n", byteSize,  expectedSize);
 			Ros_SimpleMsg_MotionReply(&receiveMsg, ROS_RESULT_INVALID, ROS_RESULT_INVALID_MSGSIZE, &replyMsg, 0);
-        	// Note: If messages are being combine together because of network transmission protocol
-        	// we may need to add code to store unused portion of the received buff that would be part of the next message
-        }
-        	
-        //Send reply message
-        byteSize = mpSend(controller->sdMotionConnections[connectionIndex], (char*)(&replyMsg), replyMsg.prefix.length + sizeof(SmPrefix), 0);        
-        if (byteSize <= 0)
-        	break;	// Close the connection
+			// Note: If messages are being combine together because of network transmission protocol
+			// we may need to add code to store unused portion of the received buff that would be part of the next message
+		}
+
+		//Send reply message
+		byteSizeResponse = mpSend(controller->sdMotionConnections[connectionIndex], (char*)(&replyMsg), replyMsg.prefix.length + sizeof(SmPrefix), 0);        
+		if (byteSizeResponse <= 0)
+			break;	// Close the connection
 	}
 	
-	mpTaskDelay(50);	// Just in case other associated task need time to clean-up.  Don't if necessary... but it doesn't hurt
+	Ros_Sleep(50);	// Just in case other associated task need time to clean-up.  Don't if necessary... but it doesn't hurt
 	
 	//close this connection
 	Ros_MotionServer_StopConnection(controller, connectionIndex);
@@ -359,6 +396,8 @@ int Ros_MotionServer_SimpleMsgProcess(Controller* controller, SimpleMsg* receive
 		else
 			invalidSubcode = ROS_RESULT_INVALID_MSGSIZE;
 		break;
+
+	//-----------------------
 	case ROS_MSG_MOTO_MOTION_CTRL:
 		// Check that the appropriate message size was received
 		expectedBytes += sizeof(SmBodyMotoMotionCtrl);
@@ -367,6 +406,8 @@ int Ros_MotionServer_SimpleMsgProcess(Controller* controller, SimpleMsg* receive
 		else
 			invalidSubcode = ROS_RESULT_INVALID_MSGSIZE;
 		break;
+
+	//-----------------------
 	case ROS_MSG_MOTO_JOINT_TRAJ_PT_FULL_EX:
 		// Check that the appropriate message size was received
 		if (byteSize >= (expectedBytes + sizeof(int))) //make sure I can at least get to [numberOfGroups] field
@@ -383,24 +424,49 @@ int Ros_MotionServer_SimpleMsgProcess(Controller* controller, SimpleMsg* receive
 			invalidSubcode = ROS_RESULT_INVALID_MSGSIZE;
 		break;
 
-	case ROS_MSG_MOTO_READ_SINGLE_IO:
+	//-----------------------
+	case ROS_MSG_MOTO_READ_IO_BIT:
 		// Check that the appropriate message size was received
-		expectedBytes += sizeof(SmBodyMotoReadSingleIO);
+		expectedBytes += sizeof(SmBodyMotoReadIOBit);
 		if(expectedBytes == byteSize)
-			ret = Ros_MotionServer_ReadIO(controller, receiveMsg, replyMsg);
+			ret = Ros_MotionServer_ReadIOBit(receiveMsg, replyMsg);
 		else
 			invalidSubcode = ROS_RESULT_INVALID_MSGSIZE;
 		break;
-	case ROS_MSG_MOTO_WRITE_SINGLE_IO:
+
+	//-----------------------
+	case ROS_MSG_MOTO_WRITE_IO_BIT:
 		// Check that the appropriate message size was received
-		expectedBytes += sizeof(SmBodyMotoWriteSingleIO);
+		expectedBytes += sizeof(SmBodyMotoWriteIOBit);
 		if(expectedBytes == byteSize)
-			ret = Ros_MotionServer_WriteIO(controller, receiveMsg, replyMsg);
+			ret = Ros_MotionServer_WriteIOBit(receiveMsg, replyMsg);
 		else
 			invalidSubcode = ROS_RESULT_INVALID_MSGSIZE;
 		break;
 
 
+	//-----------------------
+	case ROS_MSG_MOTO_READ_IO_GROUP:
+		// Check that the appropriate message size was received
+		expectedBytes += sizeof(SmBodyMotoReadIOGroup);
+		if (expectedBytes == byteSize)
+			ret = Ros_MotionServer_ReadIOGroup(receiveMsg, replyMsg);
+		else
+			invalidSubcode = ROS_RESULT_INVALID_MSGSIZE;
+		break;
+
+	//-----------------------
+	case ROS_MSG_MOTO_WRITE_IO_GROUP:
+		// Check that the appropriate message size was received
+		expectedBytes += sizeof(SmBodyMotoWriteIOGroup);
+		if (expectedBytes == byteSize)
+			ret = Ros_MotionServer_WriteIOGroup(receiveMsg, replyMsg);
+		else
+			invalidSubcode = ROS_RESULT_INVALID_MSGSIZE;
+		break;
+
+
+	//-----------------------
 	default:
 		printf("Invalid message type: %d\n", receiveMsg->header.msgType);
 		invalidSubcode = ROS_RESULT_INVALID_MSGTYPE;
@@ -417,7 +483,7 @@ int Ros_MotionServer_SimpleMsgProcess(Controller* controller, SimpleMsg* receive
 	return ret;
 }
 
-int Ros_MotionServer_ReadIO(Controller* controller, SimpleMsg* receiveMsg, SimpleMsg* replyMsg)
+int Ros_MotionServer_ReadIOBit(SimpleMsg* receiveMsg, SimpleMsg* replyMsg)
 {
 	int apiRet;
 	MP_IO_INFO ioReadInfo;
@@ -428,13 +494,13 @@ int Ros_MotionServer_ReadIO(Controller* controller, SimpleMsg* receiveMsg, Simpl
 	memset(replyMsg, 0x00, sizeof(SimpleMsg));
 	
 	// set prefix: length of message excluding the prefix
-	replyMsg->prefix.length = sizeof(SmHeader) + sizeof(SmBodyMotoReadSingleIOReply);
+	replyMsg->prefix.length = sizeof(SmHeader) + sizeof(SmBodyMotoReadIOBitReply);
 
 	// set header information of the reply
-	replyMsg->header.msgType = ROS_MSG_MOTO_READ_SINGLE_IO_REPLY;
+	replyMsg->header.msgType = ROS_MSG_MOTO_READ_IO_BIT_REPLY;
 	replyMsg->header.commType = ROS_COMM_SERVICE_REPLY;
 	
-	ioReadInfo.ulAddr = receiveMsg->body.readSingleIo.ioAddress;
+	ioReadInfo.ulAddr = receiveMsg->body.readIOBit.ioAddress;
 	apiRet = mpReadIO(&ioReadInfo, &ioValue, 1);
 
 	if (apiRet == OK)
@@ -442,13 +508,55 @@ int Ros_MotionServer_ReadIO(Controller* controller, SimpleMsg* receiveMsg, Simpl
 	else
 		resultCode = ROS_REPLY_FAILURE;
 
-	replyMsg->body.readSingleIoReply.value = ioValue;
-	replyMsg->body.readSingleIoReply.resultCode = resultCode;
+	replyMsg->body.readIOBitReply.value = ioValue;
+	replyMsg->body.readIOBitReply.resultCode = resultCode;
 	replyMsg->header.replyType = (SmReplyType)resultCode;
 	return OK;
 }
 
-int Ros_MotionServer_WriteIO(Controller* controller, SimpleMsg* receiveMsg, SimpleMsg* replyMsg)
+int Ros_MotionServer_ReadIOGroup(SimpleMsg* receiveMsg, SimpleMsg* replyMsg)
+{
+	int apiRet;
+	MP_IO_INFO ioReadInfo[8];
+	USHORT ioValue[8];
+	int resultCode;
+	int resultValue = 0;
+	int i;
+
+	//initialize memory
+	memset(replyMsg, 0x00, sizeof(SimpleMsg));
+
+	// set prefix: length of message excluding the prefix
+	replyMsg->prefix.length = sizeof(SmHeader) + sizeof(SmBodyMotoReadIOGroupReply);
+
+	// set header information of the reply
+	replyMsg->header.msgType = ROS_MSG_MOTO_READ_IO_GROUP_REPLY;
+	replyMsg->header.commType = ROS_COMM_SERVICE_REPLY;
+
+	for (i = 0; i < 8; i += 1)
+	{
+		ioReadInfo[i].ulAddr = (receiveMsg->body.readIOGroup.ioAddress * 10) + i;
+	}
+	apiRet = mpReadIO(ioReadInfo, ioValue, 8);
+
+	resultValue = 0;
+	for (i = 0; i < 8; i += 1)
+	{
+		resultValue |= (ioValue[i] << i);
+	}
+
+	if (apiRet == OK)
+		resultCode = ROS_REPLY_SUCCESS;
+	else
+		resultCode = ROS_REPLY_FAILURE;
+
+	replyMsg->body.readIOGroupReply.value = resultValue;
+	replyMsg->body.readIOGroupReply.resultCode = resultCode;
+	replyMsg->header.replyType = (SmReplyType)resultCode;
+	return OK;
+}
+
+int Ros_MotionServer_WriteIOBit(SimpleMsg* receiveMsg, SimpleMsg* replyMsg)
 {	
 	int apiRet;
 	MP_IO_DATA ioWriteData;
@@ -458,14 +566,14 @@ int Ros_MotionServer_WriteIO(Controller* controller, SimpleMsg* receiveMsg, Simp
 	memset(replyMsg, 0x00, sizeof(SimpleMsg));
 	
 	// set prefix: length of message excluding the prefix
-	replyMsg->prefix.length = sizeof(SmHeader) + sizeof(SmBodyMotoWriteSingleIOReply);
+	replyMsg->prefix.length = sizeof(SmHeader) + sizeof(SmBodyMotoWriteIOBitReply);
 
 	// set header information of the reply
-	replyMsg->header.msgType = ROS_MSG_MOTO_WRITE_SINGLE_IO_REPLY;
+	replyMsg->header.msgType = ROS_MSG_MOTO_WRITE_IO_BIT_REPLY;
 	replyMsg->header.commType = ROS_COMM_SERVICE_REPLY;
 	
-	ioWriteData.ulAddr = receiveMsg->body.writeSingleIo.ioAddress;
-	ioWriteData.ulValue = receiveMsg->body.writeSingleIo.ioValue;
+	ioWriteData.ulAddr = receiveMsg->body.writeIOBit.ioAddress;
+	ioWriteData.ulValue = receiveMsg->body.writeIOBit.ioValue;
 	apiRet = mpWriteIO(&ioWriteData, 1);
 
 	if (apiRet == OK)
@@ -473,7 +581,41 @@ int Ros_MotionServer_WriteIO(Controller* controller, SimpleMsg* receiveMsg, Simp
 	else
 		resultCode = ROS_REPLY_FAILURE;
 
-	replyMsg->body.writeSingleIoReply.resultCode = resultCode;
+	replyMsg->body.writeIOBitReply.resultCode = resultCode;
+	replyMsg->header.replyType = (SmReplyType)resultCode;
+	return OK;
+}
+
+int Ros_MotionServer_WriteIOGroup(SimpleMsg* receiveMsg, SimpleMsg* replyMsg)
+{
+	int apiRet;
+	MP_IO_DATA ioWriteData[8];
+	int resultCode;
+	int i;
+
+	//initialize memory
+	memset(replyMsg, 0x00, sizeof(SimpleMsg));
+
+	// set prefix: length of message excluding the prefix
+	replyMsg->prefix.length = sizeof(SmHeader) + sizeof(SmBodyMotoWriteIOGroupReply);
+
+	// set header information of the reply
+	replyMsg->header.msgType = ROS_MSG_MOTO_WRITE_IO_GROUP_REPLY;
+	replyMsg->header.commType = ROS_COMM_SERVICE_REPLY;
+
+	for (i = 0; i < 8; i += 1)
+	{
+		ioWriteData[i].ulAddr = (receiveMsg->body.writeIOGroup.ioAddress * 10) + i;
+		ioWriteData[i].ulValue = (receiveMsg->body.writeIOGroup.ioValue & (1 << i)) >> i;
+	}
+	apiRet = mpWriteIO(ioWriteData, 8);
+
+	if (apiRet == OK)
+		resultCode = ROS_REPLY_SUCCESS;
+	else
+		resultCode = ROS_REPLY_FAILURE;
+
+	replyMsg->body.writeIOGroupReply.resultCode = resultCode;
 	replyMsg->header.replyType = (SmReplyType)resultCode;
 	return OK;
 }
@@ -604,7 +746,7 @@ int Ros_MotionServer_MotionCtrlProcess(Controller* controller, SimpleMsg* receiv
 			if(Ros_Controller_IsMotionReady(controller))
 				Ros_SimpleMsg_MotionReply(receiveMsg, ROS_RESULT_TRUE, 0, replyMsg, receiveMsg->body.motionCtrl.groupNo);
 			else
-				Ros_SimpleMsg_MotionReply(receiveMsg, ROS_RESULT_FALSE, 0, replyMsg, receiveMsg->body.motionCtrl.groupNo);
+				Ros_SimpleMsg_MotionReply(receiveMsg, ROS_RESULT_FALSE, Ros_Controller_GetNotReadySubcode(controller), replyMsg, receiveMsg->body.motionCtrl.groupNo);
 			break;
 		}
 		case ROS_CMD_CHECK_QUEUE_CNT:
@@ -620,6 +762,42 @@ int Ros_MotionServer_MotionCtrlProcess(Controller* controller, SimpleMsg* receiv
 		{
 			// Stop Motion
 			BOOL bRet = Ros_MotionServer_StopMotion(controller);
+			
+			// Reply msg
+			if(bRet)
+				Ros_SimpleMsg_MotionReply(receiveMsg, ROS_RESULT_SUCCESS, 0, replyMsg, receiveMsg->body.motionCtrl.groupNo);
+			else 
+				Ros_SimpleMsg_MotionReply(receiveMsg, ROS_RESULT_FAILURE, 0, replyMsg, receiveMsg->body.motionCtrl.groupNo);
+			break;
+		}
+		case ROS_CMD_START_SERVOS:
+		{
+			// Stop Motion
+			BOOL bRet = Ros_MotionServer_ServoPower(controller, ON);
+			
+			// Reply msg
+			if(bRet)
+				Ros_SimpleMsg_MotionReply(receiveMsg, ROS_RESULT_SUCCESS, 0, replyMsg, receiveMsg->body.motionCtrl.groupNo);
+			else 
+				Ros_SimpleMsg_MotionReply(receiveMsg, ROS_RESULT_FAILURE, 0, replyMsg, receiveMsg->body.motionCtrl.groupNo);
+			break;
+		}
+		case ROS_CMD_STOP_SERVOS:
+		{
+			// Stop Motion
+			BOOL bRet = Ros_MotionServer_ServoPower(controller, OFF);
+			
+			// Reply msg
+			if(bRet)
+				Ros_SimpleMsg_MotionReply(receiveMsg, ROS_RESULT_SUCCESS, 0, replyMsg, receiveMsg->body.motionCtrl.groupNo);
+			else 
+				Ros_SimpleMsg_MotionReply(receiveMsg, ROS_RESULT_FAILURE, 0, replyMsg, receiveMsg->body.motionCtrl.groupNo);
+			break;
+		}
+		case ROS_CMD_RESET_ALARM:
+		{
+			// Stop Motion
+			BOOL bRet = Ros_MotionServer_ResetAlarm(controller);
 			
 			// Reply msg
 			if(bRet)
@@ -682,7 +860,7 @@ BOOL Ros_MotionServer_StopMotion(Controller* controller)
 		if(bStopped)
 			break;
 		else
-			mpTaskDelay(1);
+			Ros_Sleep(1);
 	}
 	
 	// Clear queues
@@ -695,6 +873,128 @@ BOOL Ros_MotionServer_StopMotion(Controller* controller)
 }
 
 
+//-----------------------------------------------------------------------
+// Sets servo power to ON or OFF
+//-----------------------------------------------------------------------
+BOOL Ros_MotionServer_ServoPower(Controller* controller, int servoOnOff)
+{
+	MP_SERVO_POWER_SEND_DATA sServoData;
+	MP_STD_RSP_DATA stdRespData;
+	int ret;
+	STATUS status;
+	
+#ifdef DUMMY_SERVO_MODE
+	return TRUE;
+#endif
+	
+	if (servoOnOff == OFF)
+		Ros_MotionServer_StopMotion(controller);
+
+	if (servoOnOff == ON)
+	{
+		status = Ros_MotionServer_DisableEcoMode(controller);
+		if (status == NG)
+		{
+			Ros_Controller_StatusUpdate(controller);
+			return Ros_Controller_IsServoOn(controller) == servoOnOff;
+		}
+	}
+
+	printf("Setting servo power: %d\n", servoOnOff);
+	memset(&sServoData, 0x00, sizeof(sServoData));
+	memset(&stdRespData, 0x00, sizeof(stdRespData));
+	sServoData.sServoPower = servoOnOff;
+
+	ret = mpSetServoPower(&sServoData, &stdRespData);
+	if( (ret == 0) && (stdRespData.err_no == 0) )
+	{
+		// wait for confirmation
+		int checkCount;
+		for(checkCount=0; checkCount<MOTION_START_TIMEOUT; checkCount+=MOTION_START_CHECK_PERIOD)
+		{
+			// Update status
+			Ros_Controller_StatusUpdate(controller);
+		
+			if(Ros_Controller_IsServoOn(controller) == servoOnOff)
+				break;
+			
+			Ros_Sleep(MOTION_START_CHECK_PERIOD);
+		}		
+	}
+	else
+	{
+		Ros_MotionServer_PrintError(stdRespData.err_no, "Can't turn off servo because:");
+	}
+	
+	// Update status
+	Ros_Controller_StatusUpdate(controller);
+	return Ros_Controller_IsServoOn(controller) == servoOnOff;
+}
+
+BOOL Ros_MotionServer_ResetAlarm(Controller* controller)
+{
+	int ret, i;
+	BOOL returnBoolean;
+	MP_ALARM_STATUS_RSP_DATA alarmstatus;
+	MP_STD_RSP_DATA responseData;
+	
+	returnBoolean = TRUE;
+
+	ret = mpGetAlarmStatus(&alarmstatus);
+	if( ret != 0 ) 
+	{
+		printf("Could not get alarm status\n");
+		//Ignore this error.  Continue to try and clear the alarm.
+	}
+    
+	if (alarmstatus.sIsAlarm & MASK_ISALARM_ACTIVEALARM) //alarm is active
+	{
+		MP_ALARM_CODE_RSP_DATA alarmcode;
+		ret = mpGetAlarmCode(&alarmcode);
+		if( ret != 0 ) 
+		{
+			printf("Could not get alarm code\n");
+			//Ignore this error.  Continue to try and clear the alarm.
+		}
+		else
+		{
+			for (i = 0; i < alarmcode.usAlarmNum; i += 1)
+				printf("Has alarm: %d[%d], resetting...\n", alarmcode.AlarmData.usAlarmNo[i], alarmcode.AlarmData.usAlarmData[i]);
+		}
+
+		ret = mpResetAlarm(&responseData);
+		if( ret != 0 ) 
+		{
+			printf("Could not reset the alarm, failure code: %d\n", responseData.err_no);
+			returnBoolean = FALSE;
+		}
+	}
+
+	if (alarmstatus.sIsAlarm & MASK_ISALARM_ACTIVEERROR) //error is active
+	{
+		MP_ALARM_CODE_RSP_DATA alarmcode;
+		ret = mpGetAlarmCode(&alarmcode);
+		if (ret != 0)
+		{
+			printf("Could not get error code\n");
+			//Ignore this problem.  Continue to try and clear the error.
+		}
+		else
+		{
+			printf("Has error: %d[%d], resetting...\n", alarmcode.usErrorNo, alarmcode.usErrorData);
+		}
+
+		ret = mpCancelError(&responseData);
+		if (ret != 0)
+		{
+			printf("Could not cancel the error, failure code: %d\n", responseData.err_no);
+			returnBoolean = FALSE;
+		}
+	}
+
+	Ros_Controller_StatusUpdate(controller);
+	return returnBoolean;
+}
 
 //-----------------------------------------------------------------------
 // Attempts to start playback of a job to put the controller in RosMotion mode
@@ -705,6 +1005,8 @@ BOOL Ros_MotionServer_StartTrajMode(Controller* controller)
 	MP_STD_RSP_DATA rData;
 	MP_START_JOB_SEND_DATA sStartData;
 	int checkCount;
+	int grpNo;
+	STATUS status;
 
 	printf("In StartTrajMode\r\n");
 
@@ -719,11 +1021,13 @@ BOOL Ros_MotionServer_StartTrajMode(Controller* controller)
 	if(Ros_Controller_IsOperating(controller))
 		return FALSE;
 		
+#ifndef DUMMY_SERVO_MODE
 	// Check for condition that need operator manual intervention	
 	if(Ros_Controller_IsEStop(controller)
 		|| Ros_Controller_IsHold(controller)
 		|| !Ros_Controller_IsRemote(controller))
 		return FALSE;
+#endif
 		
 	// Check for condition that can be fixed remotely
 	if(Ros_Controller_IsError(controller))
@@ -753,7 +1057,7 @@ BOOL Ros_MotionServer_StartTrajMode(Controller* controller)
 				if(Ros_Controller_IsAlarm(controller) == FALSE)
 					continue;
 			
-				mpTaskDelay(MOTION_START_CHECK_PERIOD);
+				Ros_Sleep(MOTION_START_CHECK_PERIOD);
 			}
 			if(Ros_Controller_IsAlarm(controller))
 				goto updateStatus;
@@ -763,13 +1067,21 @@ BOOL Ros_MotionServer_StartTrajMode(Controller* controller)
 	}
 	
 
+#ifndef DUMMY_SERVO_MODE
 	// Servo On
 	if(Ros_Controller_IsServoOn(controller) == FALSE)
 	{
 		MP_SERVO_POWER_SEND_DATA sServoData;
-		memset(&rData, 0x00, sizeof(rData));
 		memset(&sServoData, 0x00, sizeof(sServoData));
+
+		status = Ros_MotionServer_DisableEcoMode(controller);
+		if (status == NG)
+		{
+			goto updateStatus;
+		}
+
 		sServoData.sServoPower = 1;  // ON
+		memset(&rData, 0x00, sizeof(rData));
 		ret = mpSetServoPower(&sServoData, &rData);
 		if( (ret == 0) && (rData.err_no ==0) )
 		{
@@ -780,24 +1092,31 @@ BOOL Ros_MotionServer_StartTrajMode(Controller* controller)
 				// Update status
 				Ros_Controller_StatusUpdate(controller);
 		
-				if(Ros_Controller_IsServoOn(controller) == TRUE)
-					continue;
+				if (Ros_Controller_IsServoOn(controller) == TRUE)
+					break;
 			
-				mpTaskDelay(MOTION_START_CHECK_PERIOD);
+				Ros_Sleep(MOTION_START_CHECK_PERIOD);
 			}
 			if(Ros_Controller_IsServoOn(controller) == FALSE)
 				goto updateStatus;			
 		}
 		else
 		{
-			char errMsg[ERROR_MSG_MAX_SIZE];
-			memset(errMsg, 0x00, ERROR_MSG_MAX_SIZE);
-			Ros_Controller_ErrNo_ToString(rData.err_no, errMsg, ERROR_MSG_MAX_SIZE);
-			printf("Can't turn on servo because: %s\r\n", errMsg);
+			Ros_MotionServer_PrintError(rData.err_no, "Can't turn on servo because:");
 			goto updateStatus;			
 		}
 	}
-	
+#endif
+
+	// have to initialize the prevPulsePos that will be used when interpolating the traj
+	for(grpNo = 0; grpNo < MP_GRP_NUM; ++grpNo)
+	{
+		if(controller->ctrlGroups[grpNo] != NULL)
+		{
+			Ros_CtrlGroup_GetPulsePosCmd(controller->ctrlGroups[grpNo], controller->ctrlGroups[grpNo]->prevPulsePos);
+		}
+	}
+
 	// Start Job
 	memset(&rData, 0x00, sizeof(rData));
 	memset(&sStartData, 0x00, sizeof(sStartData));
@@ -806,10 +1125,7 @@ BOOL Ros_MotionServer_StartTrajMode(Controller* controller)
 	ret = mpStartJob(&sStartData, &rData);
 	if( (ret != 0) || (rData.err_no !=0) )
 	{
-		char errMsg[ERROR_MSG_MAX_SIZE];
-		memset(errMsg, 0x00, ERROR_MSG_MAX_SIZE);
-		Ros_Controller_ErrNo_ToString(rData.err_no, errMsg, ERROR_MSG_MAX_SIZE);
-		printf("Can't start job %s because: %s\r\n", MOTION_INIT_ROS_JOB, errMsg);
+		Ros_MotionServer_PrintError(rData.err_no, "Can't start job because:");
 		goto updateStatus;		
 	}
 	
@@ -822,7 +1138,7 @@ BOOL Ros_MotionServer_StartTrajMode(Controller* controller)
 		if(Ros_Controller_IsMotionReady(controller))
 			return(TRUE);
 			
-		mpTaskDelay(MOTION_START_CHECK_PERIOD);
+		Ros_Sleep(MOTION_START_CHECK_PERIOD);
 	}
 	
 updateStatus:	
@@ -970,10 +1286,13 @@ int Ros_MotionServer_InitTrajPointFull(CtrlGroup* ctrlGroup, SmBodyJointTrajPtFu
 		Ros_MotionServer_ConvertToJointMotionData(jointTrajData, &ctrlGroup->jointMotionData);
 		ctrlGroup->timeLeftover_ms = 0;
 		ctrlGroup->q_time = ctrlGroup->jointMotionData.time;
-	
+
 		// Convert start position to pulse format
 		Ros_CtrlGroup_ConvertToMotoPos(ctrlGroup, ctrlGroup->jointMotionData.pos, pulsePos);
 		Ros_CtrlGroup_GetPulsePosCmd(ctrlGroup, curPos);
+
+		// Initialize prevPulsePos to the current position
+		Ros_CtrlGroup_GetPulsePosCmd(ctrlGroup, ctrlGroup->prevPulsePos);
 		
 		// Check for each axis
 		for(i=0; i<MAX_PULSE_AXES; i++)
@@ -982,14 +1301,15 @@ int Ros_MotionServer_InitTrajPointFull(CtrlGroup* ctrlGroup, SmBodyJointTrajPtFu
 			if(abs(pulsePos[i] - curPos[i]) > START_MAX_PULSE_DEVIATION)
 			{
 				printf("ERROR: Trajectory start position doesn't match current position.\r\n");
-				printf("    %d, %d, %d, %d, %d, %d, %d, %d\r\n",
+				printf("    %ld, %ld, %ld, %ld, %ld, %ld, %ld, %ld\r\n",
 					pulsePos[0], pulsePos[1], pulsePos[2],
 					pulsePos[3], pulsePos[4], pulsePos[5],
 					pulsePos[6], pulsePos[7]);
-				printf("    %d, %d, %d, %d, %d, %d, %d, %d\r\n",
+				printf("    %ld, %ld, %ld, %ld, %ld, %ld, %ld, %ld\r\n",
 					curPos[0], curPos[1], curPos[2],
 					curPos[3], curPos[4], curPos[5],
 					curPos[6], curPos[7]);
+
 				return ROS_RESULT_INVALID_DATA_START_POS;
 			}
 			
@@ -1001,6 +1321,14 @@ int Ros_MotionServer_InitTrajPointFull(CtrlGroup* ctrlGroup, SmBodyJointTrajPtFu
 			}
 		}
 		
+		// For MPL80/100 robot type (SLUBT): Controller automatically moves the B-axis
+		// to maintain orientation as other axes are moved.
+		if (ctrlGroup->bIsBaxisSlave)
+		{
+			ctrlGroup->jointMotionData.pos[3] += -ctrlGroup->jointMotionData.pos[1] + ctrlGroup->jointMotionData.pos[2];
+			ctrlGroup->jointMotionData.vel[3] += -ctrlGroup->jointMotionData.vel[1] + ctrlGroup->jointMotionData.vel[2];
+		}
+
 		//printf("Trajectory Start Initialized\r\n");
 		// Return success
 		return 0;
@@ -1102,7 +1430,7 @@ void Ros_MotionServer_AddToIncQueueProcess(Controller* controller, int groupNo)
 			ctrlGroup->hasDataToProcess = FALSE;
 		}
 		
-		mpTaskDelay(interpolPeriod);
+		Ros_Sleep(interpolPeriod);
 	}		
 }
 
@@ -1128,7 +1456,6 @@ void Ros_MotionServer_JointTrajDataToIncQueue(Controller* controller, int groupN
 	int timeInc_ms;						// time increment in millisecond
 	int calculationTime_ms;				// time in ms at which the interpolation takes place
 	float interpolTime;      			// time increment in second
-	long prevPulsePos[MP_GRP_AXES_NUM];
 	long newPulsePos[MP_GRP_AXES_NUM];
 	Incremental_data incData;
 
@@ -1140,10 +1467,15 @@ void Ros_MotionServer_JointTrajDataToIncQueue(Controller* controller, int groupN
 	startTrajData = &_startTrajData;
 	// Set the start of the trajectory interpolation as the current position (which should be the end of last interpolation)
 	memcpy(startTrajData, curTrajData, sizeof(JointMotionData));
-	
-	// Set pulse position references
-	memset(prevPulsePos, 0x00, sizeof(prevPulsePos));
-	Ros_CtrlGroup_ConvertToMotoPos(ctrlGroup, curTrajData->pos, prevPulsePos);
+
+	// For MPL80/100 robot type (SLUBT): Controller automatically moves the B-axis
+	// to maintain orientation as other axes are moved.
+	if (ctrlGroup->bIsBaxisSlave)
+	{
+		endTrajData->pos[3] += -endTrajData->pos[1] + endTrajData->pos[2];
+		endTrajData->vel[3] += -endTrajData->vel[1] + endTrajData->vel[2];
+	}
+
 	memset(newPulsePos, 0x00, sizeof(newPulsePos));
 	memset(&incData, 0x00, sizeof(incData));
 	incData.frame = MP_INC_PULSE_DTYPE;
@@ -1157,15 +1489,15 @@ void Ros_MotionServer_JointTrajDataToIncQueue(Controller* controller, int groupN
 		for (i = 0; i < ctrlGroup->numAxes; i++)
 		{	
 			//Calculate acceleration coefficient (convert interval to seconds
-	     	accCoef1[i] = ( 6 * (endTrajData->pos[i] - startTrajData->pos[i]) / (interval * interval) )
-	     				- ( 2 * (endTrajData->vel[i] + 2 * startTrajData->vel[i]) / interval);
-	     	accCoef2[i] = ( -12 * (endTrajData->pos[i] - startTrajData->pos[i]) / (interval * interval * interval))
-	     				+ ( 6 * (endTrajData->vel[i] + startTrajData->vel[i]) / (interval * interval) );
+			accCoef1[i] = ( 6 * (endTrajData->pos[i] - startTrajData->pos[i]) / (interval * interval) )
+						- ( 2 * (endTrajData->vel[i] + 2 * startTrajData->vel[i]) / interval);
+			accCoef2[i] = ( -12 * (endTrajData->pos[i] - startTrajData->pos[i]) / (interval * interval * interval))
+						+ ( 6 * (endTrajData->vel[i] + startTrajData->vel[i]) / (interval * interval) );
 		}
 	}
 	else
 	{
-		printf("Warning: Group %d - Time difference between prevTrajData and newTrajData is 0 or less.\r\n", groupNo);
+		printf("Warning: Group %d - Time difference between endTrajData (%d) and startTrajData (%d) is 0 or less.\r\n", groupNo, endTrajData->time, startTrajData->time);
 	}
 	
 	// Initialize calculation variable before entering while loop
@@ -1197,7 +1529,7 @@ void Ros_MotionServer_JointTrajDataToIncQueue(Controller* controller, int groupN
 					+ accCoef2[i] * interpolTime * interpolTime * interpolTime / 6;	// accCoef2 component
 	
 				// Add velocity change for new interpolation time
-		  		curTrajData->vel[i] = startTrajData->vel[i]   						// initial velocity component
+				curTrajData->vel[i] = startTrajData->vel[i]   						// initial velocity component
 					+ accCoef1[i] * interpolTime 									// accCoef1 component
 					+ accCoef2[i] * interpolTime * interpolTime / 2;				// accCoef2 component
 			}
@@ -1205,9 +1537,9 @@ void Ros_MotionServer_JointTrajDataToIncQueue(Controller* controller, int groupN
 			// Reset the timeInc_ms for the next interpolation cycle
 			if(timeInc_ms < interpolPeriod)
 			{
-	  			timeInc_ms = interpolPeriod;
-	  			ctrlGroup->timeLeftover_ms = 0;
-	  		}
+				timeInc_ms = interpolPeriod;
+				ctrlGroup->timeLeftover_ms = 0;
+			}
 		}
 		else  // Make calculation for partial interpolation cycle
 		{
@@ -1217,36 +1549,29 @@ void Ros_MotionServer_JointTrajDataToIncQueue(Controller* controller, int groupN
 			// Set the next interpolation increment to the the remainder to reach the next interpolation cycle  
 			if(calculationTime_ms > endTrajData->time)
 			{
-		 		ctrlGroup->timeLeftover_ms = calculationTime_ms - endTrajData->time;
+				ctrlGroup->timeLeftover_ms = calculationTime_ms - endTrajData->time;
 			} 
 		}
-		
-		//printf("%d: %.5f, %.5f, %.5f, %.5f, %.5f, %.5f, %.5f\r\n", curTrajData->time,
-		//	curTrajData->pos[0], curTrajData->pos[1], curTrajData->pos[2],
-		//	curTrajData->pos[3], curTrajData->pos[4], curTrajData->pos[5],
-		//	curTrajData->pos[6]);
 	
 		// Convert position in motoman pulse joint
 		Ros_CtrlGroup_ConvertToMotoPos(ctrlGroup, curTrajData->pos, newPulsePos);
 		
 		// Calculate the increment
 		incData.time = curTrajData->time;
-		for (i = 0; i < ctrlGroup->numAxes; i++)
+		for (i = 0; i < MP_GRP_AXES_NUM; i++)
 		{
-			incData.inc[i] = (newPulsePos[i]- prevPulsePos[i]);
+			if (ctrlGroup->axisType.type[i] != AXIS_INVALID)
+				incData.inc[i] = (newPulsePos[i] - ctrlGroup->prevPulsePos[i]);
+			else
+				incData.inc[i] = 0;
 		}
 		
 		// Add the increment to the queue
 		if(!Ros_MotionServer_AddPulseIncPointToQ(controller, groupNo, &incData))
 			break;
-		
-		//printf("%d: %d, %d, %d, %d, %d, %d, %d\r\n", incData.time,
-		//	incData.inc[0], incData.inc[1], incData.inc[2],
-		//	incData.inc[3], incData.inc[4], incData.inc[5],
-		//	incData.inc[6]);
 			
 		// Copy data to the previous pulse position for next iteration
-		memcpy(prevPulsePos, newPulsePos, sizeof(prevPulsePos));
+		memcpy(ctrlGroup->prevPulsePos, newPulsePos, sizeof(ctrlGroup->prevPulsePos));
 	}
 }
 
@@ -1264,7 +1589,7 @@ BOOL Ros_MotionServer_AddPulseIncPointToQ(Controller* controller, int groupNo, I
 	while( q->cnt >= Q_SIZE ) //queue is full
 	{
 		//wait for items to be removed from the queue
-		mpTaskDelay(controller->interpolPeriod);
+		Ros_Sleep(controller->interpolPeriod);
 		
 		//make sure we don't get stuck in infinite loop
 		if (!Ros_Controller_IsMotionReady(controller)) //<- they probably pressed HOLD or ESTOP
@@ -1398,9 +1723,9 @@ BOOL Ros_MotionServer_HasDataInQueue(Controller* controller)
 //-------------------------------------------------------------------
 void Ros_MotionServer_IncMoveLoopStart(Controller* controller) //<-- IP_CLK priority task
 {
-#ifdef DX100
+#if DX100
 	MP_POS_DATA moveData;
-#elif (FS100 || DX200)
+#else
 	MP_EXPOS_DATA moveData;
 #endif
 
@@ -1409,6 +1734,7 @@ void Ros_MotionServer_IncMoveLoopStart(Controller* controller) //<-- IP_CLK prio
 	int ret;
 	LONG time;
 	LONG q_time;
+	int axis;
 	//BOOL bNoData = TRUE;  // for testing
 	
 	printf("IncMoveTask Started\r\n");
@@ -1459,7 +1785,6 @@ void Ros_MotionServer_IncMoveLoopStart(Controller* controller) //<-- IP_CLK prio
 							&&  (q->data[q->idx].time - q_time <= controller->interpolPeriod) )
 							{ 
 								// next incMove is part of same interpolation period
-								int axis;
 								
 								// check that information is in the same format
 								if( (moveData.grp_pos_info[i].pos_tag.data[2] != q->data[q->idx].tool)
@@ -1507,7 +1832,7 @@ void Ros_MotionServer_IncMoveLoopStart(Controller* controller) //<-- IP_CLK prio
 				}
 			}	
 
-#ifdef DX100
+#if DX100
 			// first robot
 			moveData.ctrl_grp = 1;
 			ret = mpMeiIncrementMove(MP_SL_ID1, &moveData);
@@ -1531,7 +1856,7 @@ void Ros_MotionServer_IncMoveLoopStart(Controller* controller) //<-- IP_CLK prio
 						printf("mpMeiIncrementMove returned: %d\r\n", ret);
 				}
 			}			
-#elif (FS100 || DX200)
+#else
 			ret = mpExRcsIncrementMove(&moveData);
 			if(ret != 0)
 			{
@@ -1578,4 +1903,55 @@ void Ros_MotionServer_ConvertToJointMotionData(SmBodyJointTrajPtFull* jointTrajD
 	}
 }
 
+void Ros_MotionServer_PrintError(USHORT err_no, char* msgPrefix)
+{
+	char errMsg[ERROR_MSG_MAX_SIZE];
+	memset(errMsg, 0x00, ERROR_MSG_MAX_SIZE);
+	Ros_Controller_ErrNo_ToString(err_no, errMsg, ERROR_MSG_MAX_SIZE);
+	printf("%s %s\r\n", msgPrefix, errMsg);
+}
 
+STATUS Ros_MotionServer_DisableEcoMode(Controller* controller)
+{
+	MP_SERVO_POWER_SEND_DATA sServoData;
+	MP_STD_RSP_DATA rData;
+	int ret;
+
+#ifdef DUMMY_SERVO_MODE
+	return OK;
+#endif
+
+	if (Ros_Controller_IsEcoMode(controller) == TRUE)
+	{
+		//toggle servos to disable energy-savings mode
+		sServoData.sServoPower = 0;  // OFF
+		memset(&sServoData, 0x00, sizeof(sServoData));
+		memset(&rData, 0x00, sizeof(rData));
+		ret = mpSetServoPower(&sServoData, &rData);
+		if ((ret == 0) && (rData.err_no == 0))
+		{
+			// wait for the Servo/Eco OFF confirmation
+			int checkCount;
+			for (checkCount = 0; checkCount<MOTION_START_TIMEOUT; checkCount += MOTION_START_CHECK_PERIOD)
+			{
+				// Update status
+				Ros_Controller_StatusUpdate(controller);
+
+				if (Ros_Controller_IsEcoMode(controller) == FALSE)
+					break;
+
+				Ros_Sleep(MOTION_START_CHECK_PERIOD);
+			}
+		}
+		else
+		{
+			Ros_MotionServer_PrintError(rData.err_no, "Can't disable energy-savings mode because:");
+			return NG;
+		}
+	}
+
+	if (Ros_Controller_IsEcoMode(controller) == FALSE)
+		return OK;
+	else
+		return NG;
+}
