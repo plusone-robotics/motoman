@@ -91,7 +91,6 @@ bool MotomanJointTrajectoryStreamer::init(SmplMsgConnection* connection, const s
   disabler_ = node_.advertiseService("/robot_disable", &MotomanJointTrajectoryStreamer::disableRobotCB, this);
 
   enabler_ = node_.advertiseService("/robot_enable", &MotomanJointTrajectoryStreamer::enableRobotCB, this);
-
   return rtn;
 }
 
