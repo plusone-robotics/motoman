@@ -92,13 +92,6 @@ bool MotomanJointTrajectoryStreamer::init(SmplMsgConnection* connection, const s
 
   enabler_ = node_.advertiseService("/robot_enable", &MotomanJointTrajectoryStreamer::enableRobotCB, this);
 
-  // hacking this in here at this place
-  io_ctrl_.init(connection);
-  this->srv_read_single_io = this->node_.advertiseService("read_single_io",
-      &MotomanJointTrajectoryStreamer::readSingleIoCB, this);
-  this->srv_write_single_io = this->node_.advertiseService("write_single_io",
-      &MotomanJointTrajectoryStreamer::writeSingleIoCB, this);
-
   return rtn;
 }
 
