@@ -158,12 +158,17 @@
 			<axis xyz="0 -1 0" />
 			<limit lower="-2.1817" upper="2.1817" effort="100" velocity="3.48" />
 		</joint>
+    <!--     
+      Our MH5 robot has joint limits for joint_t at -3.14 and 3.14 at lowest speeds.
+      If set higher, it will give pulse limit errors before.
+      We will set the limits for joint_t to -3.1 and 3.1 to be on the safe side. 
+    -->
 		<joint name="${prefix}joint_t" type="revolute">
 			<parent link="${prefix}link_b"/>
 			<child link="${prefix}link_t"/>
 			<origin xyz="0.0510 0 0" rpy="0 0 0"/>
 			<axis xyz="-1 0 0" />
-			<limit lower="-6.2831" upper="6.2831" effort="100" velocity="6.97" />
+			<limit lower="-3.1" upper="3.1" effort="100" velocity="6.97" />
 		</joint>
 		<!-- end of joint list -->
 	</xacro:macro>
